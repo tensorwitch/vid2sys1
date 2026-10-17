@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>vid2sys1</title>
+<style>
+  :root { --red:#ff2b2b; --dim:#5a1010; --bg:#000; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--red);
+    font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+  body { display:flex; flex-direction:column; gap:8px; padding:12px; }
+  header { display:flex; gap:12px; align-items:baseline; flex-wrap:wrap;
+    color:var(--dim); letter-spacing:.08em; text-transform:uppercase; }
+  header b { color:var(--red); font-weight:600; }
+  header .q { color:var(--red); text-transform:none; letter-spacing:0; opacity:.75; }
+  #wrap { flex:1; min-height:0; position:relative; }
+  #wrap.shift canvas { cursor:ns-resize; }
+  canvas { display:block; width:100%; height:100%; cursor:crosshair; touch-action:none; }
+  footer { display:flex; gap:16px; align-items:baseline; flex-wrap:wrap;
+    color:var(--dim); letter-spacing:.06em; }
+  footer .ctl { margin-left:auto; display:flex; gap:16px; align-items:baseline; flex-wrap:wrap; }
+  footer .t { color:var(--red); font-size:16px; letter-spacing:.1em; }
+  footer .v { color:var(--red); opacity:.8; }
+  footer button { background:none; border:1px solid var(--dim); color:var(--dim);
+    font:inherit; letter-spacing:.08em; text-transform:uppercase; padding:2px 8px; cursor:pointer; }
+  footer button:hover { border-color:var(--red); color:var(--red); }
+  footer label { display:flex; gap:6px; align-items:center; }
+  footer input[type=number] { width:56px; background:none; border:1px solid var(--dim);
+    color:var(--red); font:inherit; padding:1px 4px; }
+  footer input[type=number]:focus { outline:none; border-color:var(--red); }
+  footer input[type=checkbox] { accent-color:var(--red); margin:0; }
+  #err { color:var(--red); white-space:pre-wrap; }
+  #drop { position:fixed; inset:0; display:none; place-items:center; z-index:9;
+    background:rgba(0,0,0,.85); border:2px dashed var(--red); color:var(--red);
+    letter-spacing:.2em; text-transform:uppercase; font-size:14px; pointer-events:none; }
+  #drop.on { display:grid; }
+</style>
+<header>
+  <b>vid2sys1</b>
+  <span id="meta"></span>
+  <span class="q" id="q"></span>
+</header>
+<div id="wrap"><canvas id="c"></canvas></div>
+<div id="drop">drop run_results.json</div>
+<footer>
+  <span class="t" id="ts">--:--:--:---</span>
+  <span class="v" id="val"></span>
+  <span id="err"></span>
+  <div class="ctl">
+    <button id="copy">copy</button>
+    <label>thr <input id="thr" type="number" min="0" max="1" step="0.01" value="0.5"></label>
+    <button id="copyx">copy ↑thr</button>
+    <label>smooth <input id="smooth" type="number" min="0" max="100" step="1" value="0"></label>
+    <label><input id="norm" type="checkbox"> norm</label>
+  </div>
+</footer>
+<script>
+const $ = id => document.getElementById(id);
+const c = $('c'), ctx = c.getContext('2d');
+const RED = '#ff2b2b', DIM = '#5a1010', BG = '#000';
+const PAD = { l: 44, r: 12, t: 10, b: 22 };
+
+let data = null, curve = null, smooth = 0, norm = false, sel = null, hover = null, geom = null;
+let thr = 0.5, thrHover = null;
+const clamp = (v, hi = 1) => Math.min(hi, Math.max(0, v));
+const err = msg => { $('err').textContent = msg; };
+const line = () => curve || (data ? data.pts : []);
+
+const parseTs = s => {
+  const m = /^(\d+):(\d+):(\d+):(\d+)$/.exec(s || '');
+  return m ? (+m[1]) * 3600 + (+m[2]) * 60 + (+m[3]) + (+m[4]) / 1000 : NaN;
+};
+const fmtTs = s => {
+  const ms = Math.max(0, Math.round((s || 0) * 1000)), p = (n, w) => String(n).padStart(w, '0');
+  return p(Math.floor(ms / 3600000), 2) + ':' + p(Math.floor(ms / 60000) % 60, 2) + ':'
+    + p(Math.floor(ms / 1000) % 60, 2) + ':' + p(ms % 1000, 3);
+};
+
+function load(json) {
+  const h = json.header || {}, fr = json.frames || [];
+  if (!fr.length) throw new Error('no frames in input');
+  const fps = h.fps || 1;
+  const pts = fr.map((f, i) => {
+    const t = parseTs(f.timestamp);
+    return { t: Number.isFinite(t) ? t : i / fps, v: +f.noul, ts: f.timestamp || fmtTs(i / fps) };
+  }).filter(p => Number.isFinite(p.v)).sort((a, b) => a.t - b.t);
+  if (!pts.length) throw new Error('no numeric noul values');
+  data = { pts, header: h };
+  $('meta').textContent = [
+    h.model, h.fps ? h.fps + 'fps' : '', pts.length + ' frames',
+    h.resolution ? h.resolution.width + 'x' + h.resolution.height : '',
+  ].filter(Boolean).join(' · ');
+  $('q').textContent = h.question || '';
+  document.title = 'vid2sys1 — ' + (h.question || 'series');
+  sel = hover = null;
+  curve = smoothPts(pts, smooth);
+  render();
+}
+
+// gaussian kernel over the value series; amt 0..100 → sigma 0..n/10 samples
+function smoothPts(pts, amt) {
+  if (!amt) return pts;
+  const n = pts.length, sigma = Math.max(0.5, amt / 100 * n / 10), r = Math.ceil(sigma * 3);
+  const k = [];
+  for (let i = -r; i <= r; i++) k.push(Math.exp(-(i * i) / (2 * sigma * sigma)));
+  return pts.map((p, i) => {
+    let sw = 0, sv = 0;
+    for (let j = Math.max(0, i - r), e = Math.min(n - 1, i + r); j <= e; j++) {
+      const w = k[j - i + r]; sw += w; sv += w * pts[j].v;
+    }
+    return { t: p.t, v: sv / sw, ts: p.ts };
+  });
+}
+
+function resize() {
+  const r = $('wrap').getBoundingClientRect(), dpr = devicePixelRatio || 1;
+  c.width = Math.max(1, Math.round(r.width * dpr));
+  c.height = Math.max(1, Math.round(r.height * dpr));
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  render();
+}
+
+function render() {
+  const w = c.clientWidth, h = c.clientHeight;
+  ctx.fillStyle = BG; ctx.fillRect(0, 0, w, h);
+  if (!data) return;
+  const { pts } = data;
+  const x0 = PAD.l, x1 = w - PAD.r, y0 = PAD.t, y1 = h - PAD.b;
+  const t0 = pts[0].t, t1 = Math.max(pts[pts.length - 1].t, t0 + 1e-6);
+  const X = t => x0 + (t - t0) / (t1 - t0) * (x1 - x0);
+  const ln = line();
+  let lo = 0, hi = 1;
+  if (norm) {
+    lo = Infinity; hi = -Infinity;
+    for (const p of ln) { if (p.v < lo) lo = p.v; if (p.v > hi) hi = p.v; }
+    if (!(hi > lo)) { lo -= .5; hi += .5; }
+  }
+  const Y = v => y1 - (v - lo) / (hi - lo) * (y1 - y0);
+  geom = { x0, x1, y0, y1, t0, t1, lo, hi, X, Y };
+
+  ctx.font = '10px ui-monospace,monospace';
+  ctx.lineWidth = 1;
+  // grid + labels
+  for (let i = 0; i <= 4; i++) {
+    const v = lo + (hi - lo) * i / 4;
+    const y = Math.round(Y(v)) + .5;
+    ctx.strokeStyle = i % 4 === 0 ? DIM : '#2a0808';
+    ctx.beginPath(); ctx.moveTo(x0, y); ctx.lineTo(x1, y); ctx.stroke();
+    ctx.fillStyle = DIM; ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+    ctx.fillText(norm ? v.toFixed(3) : v.toFixed(2), x0 - 6, y);
+  }
+  const span = t1 - t0, step = niceStep(span / Math.max(2, Math.floor((x1 - x0) / 90)));
+  ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+  for (let t = Math.ceil(t0 / step) * step; t <= t1 + 1e-9; t += step) {
+    const x = Math.round(X(t)) + .5;
+    ctx.strokeStyle = '#2a0808';
+    ctx.beginPath(); ctx.moveTo(x, y0); ctx.lineTo(x, y1); ctx.stroke();
+    ctx.fillStyle = DIM; ctx.fillText(shortT(t), x, y1 + 5);
+  }
+
+  const hLine = (v, alpha, dash, label) => {
+    const y = Math.round(Y(v)) + .5;
+    ctx.save();
+    ctx.strokeStyle = RED; ctx.globalAlpha = alpha; ctx.lineWidth = 1; ctx.setLineDash(dash);
+    ctx.beginPath(); ctx.moveTo(x0, y); ctx.lineTo(x1, y); ctx.stroke();
+    ctx.restore();
+    if (!label) return;
+    ctx.fillStyle = RED; ctx.textAlign = 'left'; ctx.textBaseline = 'bottom';
+    ctx.fillText(label, x1 - 30, y - 2);
+  };
+  if (thr >= lo && thr <= hi) hLine(thr, .55, [2, 3]);
+  if (thrHover !== null && thrHover >= lo && thrHover <= hi) hLine(thrHover, .9, [1, 2], thrHover.toFixed(2));
+
+  // series (raw dots + smoothed curve)
+  ctx.strokeStyle = RED; ctx.lineWidth = 1.5; ctx.lineJoin = 'round';
+  ctx.beginPath();
+  ln.forEach((p, i) => i ? ctx.lineTo(X(p.t), Y(p.v)) : ctx.moveTo(X(p.t), Y(p.v)));
+  ctx.stroke();
+  ctx.fillStyle = smooth ? DIM : RED;
+  for (const p of pts) ctx.fillRect(X(p.t) - 1, Y(p.v) - 1, 2, 2);
+
+  // selection
+  const s = sel || hover;
+  if (s) {
+    const x = Math.round(X(s.t)) + .5;
+    ctx.strokeStyle = sel ? RED : DIM; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x, y0); ctx.lineTo(x, y1); ctx.stroke();
+    ctx.fillStyle = sel ? RED : DIM;
+    ctx.beginPath(); ctx.arc(X(s.t), Y(s.v), 3, 0, 7); ctx.fill();
+  }
+  $('ts').textContent = s ? s.ts : '--:--:--:---';
+  $('val').textContent = s ? 'noul ' + s.v.toFixed(4) : '';
+}
+
+const niceStep = raw => {
+  const p = Math.pow(10, Math.floor(Math.log10(raw || 1)));
+  const n = raw / p;
+  return (n <= 1 ? 1 : n <= 2 ? 2 : n <= 5 ? 5 : 10) * p;
+};
+const shortT = t => {
+  const m = Math.floor(t / 60), s = t - m * 60;
+  return m ? m + ':' + String(Math.floor(s)).padStart(2, '0') : s.toFixed(s < 10 ? 1 : 0) + 's';
+};
+
+function pick(clientX) {
+  if (!data || !geom) return null;
+  const r = c.getBoundingClientRect(), x = clientX - r.left;
+  const { x0, x1, t0, t1 } = geom;
+  const t = t0 + clamp((x - x0) / Math.max(1, x1 - x0)) * (t1 - t0);
+  let best = data.pts[0];
+  for (const p of data.pts) if (Math.abs(p.t - t) < Math.abs(best.t - t)) best = p;
+  return best;
+}
+
+function valAt(clientY) {
+  if (!geom) return null;
+  const r = c.getBoundingClientRect(), { y0, y1, lo, hi } = geom;
+  const f = clamp((y1 - (clientY - r.top)) / Math.max(1, y1 - y0));
+  return Math.round((lo + f * (hi - lo)) * 100) / 100;
+}
+
+c.addEventListener('pointerdown', e => {
+  if (e.shiftKey && e.button === 0) {
+    const v = valAt(e.clientY);
+    if (v !== null) { setThr(v); thrHover = null; render(); }
+    return;
+  }
+  sel = pick(e.clientX); render();
+  if (sel) copy(sel.ts);
+});
+c.addEventListener('pointermove', e => {
+  if (e.pointerType !== 'mouse') return;
+  if (e.shiftKey) {
+    const v = valAt(e.clientY);
+    if (v !== thrHover) { thrHover = v; hover = null; render(); }
+    return;
+  }
+  if (thrHover !== null) thrHover = null;
+  hover = pick(e.clientX); render();
+});
+c.addEventListener('pointerleave', () => { hover = thrHover = null; render(); });
+addEventListener('keydown', e => { if (e.key === 'Shift') $('wrap').classList.add('shift'); });
+addEventListener('keyup', e => {
+  if (e.key !== 'Shift') return;
+  $('wrap').classList.remove('shift');
+  if (thrHover !== null) { thrHover = null; render(); }
+});
+
+function copy(text, note) {
+  const done = () => err(note || '');
+  const fail = () => err('copy blocked — select: ' + text);
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).then(done, fail);
+  } else {
+    const ta = document.createElement('textarea');
+    ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy') ? done() : fail(); } catch { fail(); }
+    ta.remove();
+  }
+}
+$('copy').onclick = () => { if (sel) copy(sel.ts); };
+
+// timestamps where the displayed series (MA when smooth>0) crosses up through thr
+function crosses(thr) {
+  const ln = line(), out = [];
+  for (let i = 1; i < ln.length; i++) {
+    const a = ln[i - 1], b = ln[i];
+    if (a.v < thr && b.v >= thr) out.push(fmtTs(a.t + (thr - a.v) / (b.v - a.v) * (b.t - a.t)));
+  }
+  return out;
+}
+$('copyx').onclick = () => {
+  if (!data) return;
+  const xs = crosses(thr);
+  if (!xs.length) { err('no crosses above ' + thr); return; }
+  copy(xs.join(', '), xs.length + ' crosses above ' + thr);
+};
+function setThr(v) {
+  thr = clamp(Math.round(v * 100) / 100);
+  $('thr').value = thr;
+}
+$('thr').oninput = e => { thr = clamp(+e.target.value || 0); render(); };
+$('thr').onchange = e => { setThr(thr); render(); };
+$('smooth').oninput = e => {
+  smooth = clamp(Math.round(+e.target.value || 0), 100);
+  if (data) curve = smoothPts(data.pts, smooth);
+  render();
+};
+$('smooth').onchange = e => { e.target.value = smooth; };
+$('norm').onchange = e => { norm = e.target.checked; render(); };
+
+addEventListener('resize', resize);
+
+// drag & drop a run_results.json anywhere on the page
+const drop = $('drop');
+let depth = 0;
+const hasFiles = e => e.dataTransfer && [...e.dataTransfer.types].includes('Files');
+const onDrag = (type, fn) => addEventListener(type, e => {
+  if (!hasFiles(e)) return;
+  e.preventDefault();
+  fn(e);
+});
+onDrag('dragenter', () => { depth++; drop.classList.add('on'); });
+onDrag('dragover', e => { e.dataTransfer.dropEffect = 'copy'; });
+onDrag('dragleave', () => { if (--depth <= 0) { depth = 0; drop.classList.remove('on'); } });
+onDrag('drop', async e => {
+  depth = 0; drop.classList.remove('on');
+  const file = e.dataTransfer.files[0];
+  if (!file) return;
+  try {
+    load(JSON.parse(await file.text()));
+    err('');
+  } catch (ex) {
+    err('load failed (' + file.name + '): ' + ex.message);
+  }
+});
+
+// input: embedded <script id="run"> | ?src=/#<url> override | default relative run_results.json
+(async () => {
+  const qs = new URLSearchParams(location.search);
+  const src = qs.get('src') || (location.hash.length > 1 ? decodeURIComponent(location.hash.slice(1)) : null);
+  const embedded = document.getElementById('run');
+  try {
+    if (embedded && embedded.textContent.trim()) {
+      load(JSON.parse(embedded.textContent));
+    } else {
+      // relative to this page; the server maps it to the --out file
+      const target = src || 'run_results.json';
+      const r = await fetch(target, { cache: 'no-store' });
+      if (!r.ok) throw new Error('fetch ' + target + ' → HTTP ' + r.status);
+      load(await r.json());
+    }
+  } catch (e) {
+    err('load failed: ' + e.message + ' — drop run_results.json here');
+  }
+  resize();
+})();
+</script>
+</html>
